@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Author-side generator for the RG6 string splicer.
+
+No protected string exists as a contiguous plaintext run in the binary. Each
+string is cut into small fragments; every fragment is independently encoded
+(add, xor, rotate-left) and scattered -- in shuffled order, mixed with pure
+decoy fragments -- into a single byte pool. A per-string index list records the
+ordered fragment ids needed to rebuild it. Decoy strings (a fake password and a
+fake flag) get ids too but are never used on the success path.
+
+Emits crackme/protection/spliced_strings.hpp.
+
+Usage: python tools/generate_string_splices.py
+"""
+import os
+import random
+
+# id name -> real value. ENUM ORDER below fixes the numeric ids the C++ uses.
+STRINGS = {
+    "Banner":       "== RankGate Insane 6 :: Standalone Edition ==",
+    "Prompt":       "Enter access password: ",
+    "Granted":      "ACCESS GRANTED",
+    "Denied":       "ACCESS DENIED",
+    "FlagPrefix":   "Recovered flag: ",
+    "ErrInput":     "input rejected: empty password",
+    "Hint":         "hint: the password is not stored here -- derive the key",
+    "DevMode":      "[dev] protection layers disabled (--no-protection)",
+    # --- decoys: never referenced on the success path -----------------------
+    "FakePassword": "letmein-rankgate-admin-2026",
+    "FakeFlag":     "FLAG{n0t_the_real_flag_keep_reversing_the_kdf}",
+}
+
+ENUM_ORDER = list(STRINGS.keys())
+
+
+def rol8(v: int, r: int) -> int:
+    r &= 7
+    return ((v << r) | (v >> (8 - r))) & 0xFF if r else v & 0xFF
+
+
+def main() -> None:
+    rng = random.Random()  # nondeterministic layout each run; ids are stable
+
+    pool = bytearray()
+    frags = []          # (off, len, xr, ad, ro)
+    str_frag_ids = {}   # name -> [frag index, ...] in order
+
+    def emit_fragment(chunk: bytes) -> int:
+        xr, ad, ro = rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 7)
+        off = len(pool)
+        for c in chunk:
+            pool.append(rol8(((c + ad) & 0xFF) ^ xr, ro))
+        frags.append((off, len(chunk), xr, ad, ro))
+        return len(frags) - 1
+
+    # Build real fragments, but defer assigning final ids until after shuffle.
+    pending = []  # (name, order_index, off, len, xr, ad, ro)
+    for name in ENUM_ORDER:
+        data = STRINGS[name].encode("utf-8")
+        i = 0
+        order = 0
+        while i < len(data):
+            n = min(len(data) - i, rng.randint(2, 5))
+            xr, ad, ro = rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 7)
+            off = len(pool)
+            for c in data[i:i + n]:
+                pool.append(rol8(((c + ad) & 0xFF) ^ xr, ro))
+            pending.append([name, order, off, n, xr, ad, ro])
+            order += 1
+            i += n
+
+    # Pure decoy fragments (unreferenced bytes that look like more fragments).
+    decoy_count = max(8, len(pending) // 3)
+    for _ in range(decoy_count):
+        junk = bytes(rng.randint(32, 126) for _ in range(rng.randint(2, 5)))
+        emit_fragment(junk)
+
+    # Shuffle the fragment table so on-disk order reveals nothing.
+    perm = list(range(len(frags) + len(pending)))
+    # frags currently holds only decoys; append pending as real frags
+    real_base = len(frags)
+    for p in pending:
+        frags.append((p[2], p[3], p[4], p[5], p[6]))
+    new_index = list(range(len(frags)))
+    rng.shuffle(new_index)
+    inv = [0] * len(frags)
+    for new_pos, old in enumerate(new_index):
+        inv[old] = new_pos
+    shuffled = [frags[old] for old in new_index]
+
+    # Resolve each string's ordered fragment ids into the shuffled table.
+    for name in ENUM_ORDER:
+        ids = []
+        items = sorted([p for p in pending if p[0] == name], key=lambda p: p[1])
+        # recover original frag index for each pending item
+        for p in items:
+            orig = real_base + pending.index(p)
+            ids.append(inv[orig])
+        str_frag_ids[name] = ids
+
+    write_header(pool, shuffled, str_frag_ids)
+
+
+def write_header(pool, frags, str_frag_ids) -> None:
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out = os.path.join(here, "crackme", "protection", "spliced_strings.hpp")
+
+    enum_lines = ",\n".join(f"    {n}" for n in ENUM_ORDER)
+
+    pool_rows = []
+    for i in range(0, len(pool), 16):
+        pool_rows.append("    " + ", ".join(f"0x{b:02x}" for b in pool[i:i + 16]) + ",")
+    pool_block = "\n".join(pool_rows)
+
+    frag_rows = []
+    for (off, ln, xr, ad, ro) in frags:
+        frag_rows.append(f"    {{ {off}, {ln}, {xr}, {ad}, {ro} }},")
+    frag_block = "\n".join(frag_rows)
+
+    flat_idx = []
+    refs = []
+    for n in ENUM_ORDER:
+        ids = str_frag_ids[n]
+        refs.append((len(flat_idx), len(ids)))
+        flat_idx.extend(ids)
+    idx_block = ", ".join(str(i) for i in flat_idx)
+    ref_rows = "\n".join(f"    {{ {s}, {c} }}," for (s, c) in refs)
+
+    text = f"""// path: crackme/protection/spliced_strings.hpp
+//
+// GENERATED by tools/generate_string_splices.py -- do not edit by hand.
+// See string_splicer.cpp for the decode logic. No protected string is stored
+// contiguously; the pool also contains unreferenced decoy fragments.
+#pragma once
+
+#include <cstdint>
+
+namespace rg6::splice {{
+
+enum Id : int {{
+{enum_lines}
+}};
+
+struct Frag {{
+    uint16_t off;
+    uint8_t len;
+    uint8_t xr;
+    uint8_t ad;
+    uint8_t ro;
+}};
+
+struct StrRef {{
+    uint16_t start;
+    uint16_t count;
+}};
+
+inline constexpr uint8_t kPool[] = {{
+{pool_block}
+}};
+
+inline constexpr Frag kFrags[] = {{
+{frag_block}
+}};
+
+inline constexpr uint16_t kStrFragIdx[] = {{ {idx_block} }};
+
+inline constexpr StrRef kStrings[] = {{
+{ref_rows}
+}};
+
+}}  // namespace rg6::splice
+"""
+    with open(out, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    print(f"wrote {out}: {len(frags)} fragments, {len(ENUM_ORDER)} strings")
+
+
+if __name__ == "__main__":
+    main()
